@@ -6,6 +6,7 @@ from datasets import Dataset, load_dataset, load_from_disk
 from string import Template
 import argparse
 import torch.distributed as dist
+import os
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Distil Trainer")
@@ -15,15 +16,14 @@ def parse_args():
     parser.add_argument("--ref_model_mixup_alpha", type=float, default=0.01, help="Reference model mixup alpha")
     parser.add_argument("--output_dir", type=str, help="Output directory")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct", help="Model name")
+    parser.add_argument("--dataset_name", type=str, default="tooluse", help="Dataset name", choices=["tooluse", "science"])
     parser.add_argument("--seed", type=int, default=42, help="Seed")
     return parser.parse_args()
 
 def load_tooluse_dataset(seed=42) -> Dataset:
     """Load and prepare tooluse dataset with formatted prompts."""
-    train_path = 'data/tooluse_data/train_data.json'
-    test_path = 'data/tooluse_data/eval_data.json'
-    train_dataset = Dataset.from_json(train_path)
-    test_dataset = Dataset.from_json(test_path)
+    train_dir = 'data/tooluse_data/train_data'
+    train_dataset = load_from_disk(train_dir) 
 
     def format_example(example):
 
@@ -46,6 +46,39 @@ Now answer with a response of your own, including the thinking process.
     return train_dataset, None
 
 
+def load_science_dataset(seed=42) -> Dataset:
+    """Load and prepare science dataset with formatted prompts."""
+    path = 'data/science_data/train_data'
+    print(f"Loading science dataset from {path}")
+    dataset = load_from_disk(path)
+
+    def format_example(example):
+        teacher_prompt = Template("""
+$orig_content
+
+This is an example for a response to the question:
+$output_text
+
+Now answer with a response of your own, including the thinking process.
+""")
+
+        return {
+            "prompt": example["messages"],
+            "teacher_prompt": [
+                example["messages"][0],
+                {'role': 'user', 'content': teacher_prompt.substitute(
+                    orig_content=example['messages'][1]['content'],
+                    output_text=example['output_text']
+                )},
+            ],
+        }
+
+    dataset = dataset.map(format_example, remove_columns=dataset.column_names)
+    dataset = dataset.shuffle(seed=seed)
+    print(f"Loaded {len(dataset)} training examples")
+    return dataset, None
+
+
 if __name__ == "__main__":
     args = parse_args()
     model = AutoModelForCausalLM.from_pretrained(
@@ -57,7 +90,12 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    dataset, _ = load_tooluse_dataset(args.seed)
+    if args.dataset_name == "tooluse":
+        dataset, _ = load_tooluse_dataset(args.seed)
+    elif args.dataset_name == "science":
+        dataset, _ = load_science_dataset(args.seed)
+    else:
+        raise ValueError(f"Invalid dataset name: {args.dataset_name}")
 
     config = DistilConfig(
         seed=args.seed,
@@ -77,6 +115,8 @@ if __name__ == "__main__":
         max_prompt_length = 1024,
         max_completion_length = 1024,
         num_train_epochs = args.num_train_epochs,
+        num_iterations = 1,
+        num_generations = 1,
         save_steps = 100,
         max_grad_norm = 1,
         report_to = "wandb",
