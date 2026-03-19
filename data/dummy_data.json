@@ -1,0 +1,14 @@
+[
+    {"question": "What is 2 + 2?",                         "answer": "4"},
+    {"question": "What is the capital of France?",          "answer": "Paris"},
+    {"question": "What color is the sky on a clear day?",   "answer": "Blue"},
+    {"question": "What is 3 times 3?",                      "answer": "9"},
+    {"question": "Name a primary color.",                   "answer": "Red, blue, and yellow are primary colors."},
+    {"question": "What is 10 minus 7?",                     "answer": "3"},
+    {"question": "What planet do we live on?",              "answer": "Earth"},
+    {"question": "What is 5 + 5?",                         "answer": "10"},
+    {"question": "How many days are in a week?",            "answer": "7"},
+    {"question": "What is the boiling point of water in Celsius?", "answer": "100 degrees Celsius"},
+    {"question": "What is the square root of 16?",          "answer": "4"},
+    {"question": "How many sides does a triangle have?",    "answer": "3"}
+]
