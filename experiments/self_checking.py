@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str,
                         default="experiments/results/self_checking")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--smoke", action="store_true",
+                        help="Smoke test: run 2 questions with 2 rollouts to verify the pipeline works")
     return parser.parse_args()
 
 
@@ -131,11 +133,12 @@ def format_prompt(tokenizer, messages: list) -> str:
 # ── generation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def generate_rollouts(model, tokenizer, input_ids, n_rollouts, temperature, max_new_tokens):
+def generate_rollouts(model, tokenizer, input_ids, attention_mask, n_rollouts, temperature, max_new_tokens):
     rollouts = []
     for _ in range(n_rollouts):
         output = model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
@@ -247,6 +250,12 @@ def main():
     model.eval()
     device = next(model.parameters()).device
 
+    if args.smoke:
+        args.n_samples = 2
+        args.n_rollouts = 2
+        args.max_new_tokens = 128
+        print("*** SMOKE TEST — 2 questions, 2 rollouts ***")
+
     print("Loading science eval dataset...")
     dataset = load_from_disk("data/science_data/eval_data")
     if args.n_samples:
@@ -264,12 +273,14 @@ def main():
 
     for i, example in enumerate(dataset):
         prompt_str = format_prompt(tokenizer, example["prompt"])
-        input_ids = tokenizer(prompt_str, return_tensors="pt").input_ids.to(device)
+        encoded = tokenizer(prompt_str, return_tensors="pt").to(device)
+        input_ids = encoded.input_ids
+        attention_mask = encoded.attention_mask
         gold = example["answer"].strip().upper()
 
         # generate rollouts
         rollouts = generate_rollouts(
-            model, tokenizer, input_ids,
+            model, tokenizer, input_ids, attention_mask,
             args.n_rollouts, args.temperature, args.max_new_tokens
         )
 
