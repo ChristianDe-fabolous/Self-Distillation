@@ -48,6 +48,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True,
                         help="HuggingFace model ID or local path")
+    parser.add_argument("--dataset", type=str, default="science", choices=["science", "dummy"],
+                        help="Dataset to evaluate on")
+    parser.add_argument("--dummy_path", type=str, default="data/dummy_data.json",
+                        help="Path to dummy_data.json (only used when --dataset dummy)")
     parser.add_argument("--n_rollouts", type=int, default=8,
                         help="Number of rollouts per question")
     parser.add_argument("--temperature", type=float, default=0.7,
@@ -67,34 +71,76 @@ def parse_args():
 
 def assign_token_regions(completion_ids: torch.Tensor, tokenizer) -> list[str]:
     """
-    Decode token by token, track cumulative text, assign each token to a region:
-      'reasoning' — inside <reasoning>...</reasoning>
+    Assign each completion token to a region by scanning token IDs directly.
+
+      'reasoning' — inside <think>...</think> or <reasoning>...</reasoning>
       'answer'    — inside <answer>...</answer>
-      'other'     — outside both tags (structural markers, preamble)
+      'other'     — outside both (structural markers, preamble, tag tokens)
 
-    Returns a list of region labels, one per token.
+    Works by encoding each boundary tag to its token ID sequence once, then
+    running a state machine over completion_ids — no text decoding, no
+    character mapping, no tokenizer normalisation issues.
     """
-    regions = []
-    cumulative = ""
-    for tid in completion_ids.tolist():
-        tok = tokenizer.decode([tid])
-        cumulative += tok
+    ids = completion_ids.tolist()
+    n = len(ids)
+    if not n:
+        return []
 
-        in_reasoning = bool(
-            re.search(r"<reasoning>(?!.*</reasoning>)", cumulative, re.DOTALL)
-            and not re.search(r"</reasoning>.*$", cumulative.split("<reasoning>")[-1], re.DOTALL)
-        )
-        in_answer = bool(
-            re.search(r"<answer>(?!.*</answer>)", cumulative, re.DOTALL)
-            and not re.search(r"</answer>.*$", cumulative.split("<answer>")[-1], re.DOTALL)
-        )
+    def enc(tag):
+        return tokenizer.encode(tag, add_special_tokens=False)
+
+    open_think_seqs  = [enc("<think>"),     enc("<reasoning>")]
+    close_think_seqs = [enc("</think>"),    enc("</reasoning>")]
+    open_ans_seqs    = [enc("<answer>")]
+    close_ans_seqs   = [enc("</answer>")]
+
+    def match_len(pos, seq_list):
+        """Return length of the first matching sequence starting at pos, else 0."""
+        for seq in seq_list:
+            if seq and ids[pos : pos + len(seq)] == seq:
+                return len(seq)
+        return 0
+
+    regions = []
+    in_think = False
+    in_answer = False
+    i = 0
+    while i < n:
+        skip = match_len(i, open_think_seqs)
+        if skip:
+            regions.extend(["other"] * skip)
+            in_think = True
+            i += skip
+            continue
+
+        skip = match_len(i, close_think_seqs)
+        if skip:
+            regions.extend(["other"] * skip)
+            in_think = False
+            i += skip
+            continue
+
+        skip = match_len(i, open_ans_seqs)
+        if skip:
+            regions.extend(["other"] * skip)
+            in_answer = True
+            i += skip
+            continue
+
+        skip = match_len(i, close_ans_seqs)
+        if skip:
+            regions.extend(["other"] * skip)
+            in_answer = False
+            i += skip
+            continue
 
         if in_answer:
             regions.append("answer")
-        elif in_reasoning:
+        elif in_think:
             regions.append("reasoning")
         else:
             regions.append("other")
+        i += 1
 
     return regions
 
@@ -116,12 +162,59 @@ def region_stats(logprobs: torch.Tensor, regions: list[str], region: str) -> dic
     }
 
 
+# ── dataset loading ───────────────────────────────────────────────────────────
+
+def load_science_dataset(n_samples):
+    dataset = load_from_disk("data/science_data/eval_data")
+    if n_samples:
+        dataset = dataset.select(range(min(n_samples, len(dataset))))
+    # each example: {"prompt": list[dict], "answer": str}
+    return [{"prompt": ex["prompt"], "gold": ex["answer"].strip().upper()} for ex in dataset]
+
+
+def load_dummy_dataset(path, n_samples):
+    with open(path) as f:
+        examples = json.load(f)
+    if n_samples:
+        examples = examples[:n_samples]
+    return [
+        {
+            "prompt": [{"role": "user", "content": ex["question"]}],
+            "gold": ex["answer"],
+        }
+        for ex in examples
+    ]
+
+
 # ── answer extraction ─────────────────────────────────────────────────────────
 
-def extract_answer(text: str) -> str:
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> block if present, return the rest."""
+    if "</think>" in text:
+        text = text.split("</think>", 1)[-1]
+    return text.strip()
+
+
+def extract_answer_science(text: str) -> str:
+    """Extract single letter (A-D) from model output."""
+    text = _strip_thinking(text)
     if "<answer>" in text:
         text = text.split("<answer>")[-1].split("</answer>")[0]
     return text.strip().upper()[:1]
+
+
+def extract_answer_dummy(text: str) -> str:
+    """Extract free-form answer after thinking block."""
+    text = _strip_thinking(text)
+    if "<answer>" in text:
+        text = text.split("<answer>")[-1].split("</answer>")[0]
+    return text.strip()
+
+
+def is_correct_dummy(predicted: str, gold: str) -> bool:
+    """Case-insensitive substring match in either direction."""
+    p, g = predicted.lower(), gold.lower()
+    return g in p or p in g
 
 
 def format_prompt(tokenizer, messages: list) -> str:
@@ -220,8 +313,16 @@ def select_random(answers: list, rng: random.Random) -> str:
     return rng.choice(answers)
 
 
-def select_majority(answers: list) -> str:
+def select_majority_science(answers: list) -> str:
     valid = [a for a in answers if a in "ABCD"]
+    if not valid:
+        return ""
+    return Counter(valid).most_common(1)[0][0]
+
+
+def select_majority_free(answers: list) -> str:
+    """Majority vote over arbitrary strings; empty strings are ignored."""
+    valid = [a for a in answers if a]
     if not valid:
         return ""
     return Counter(valid).most_common(1)[0][0]
@@ -256,10 +357,20 @@ def main():
         args.max_new_tokens = 128
         print("*** SMOKE TEST — 2 questions, 2 rollouts ***")
 
-    print("Loading science eval dataset...")
-    dataset = load_from_disk("data/science_data/eval_data")
-    if args.n_samples:
-        dataset = dataset.select(range(min(args.n_samples, len(dataset))))
+    if args.dataset == "dummy":
+        print(f"Loading dummy dataset from {args.dummy_path}...")
+        examples = load_dummy_dataset(args.dummy_path, args.n_samples)
+        extract_answer = extract_answer_dummy
+        select_majority = select_majority_free
+        def check_correct(pred, gold):
+            return is_correct_dummy(pred, gold)
+    else:
+        print("Loading science eval dataset...")
+        examples = load_science_dataset(args.n_samples)
+        extract_answer = extract_answer_science
+        select_majority = select_majority_science
+        def check_correct(pred, gold):
+            return pred == gold
 
     correct_random, correct_majority, correct_kl = 0, 0, 0
 
@@ -271,12 +382,12 @@ def main():
     samples_path = os.path.join(args.output_dir, "samples.jsonl")
     samples_file = open(samples_path, "w")
 
-    for i, example in enumerate(dataset):
+    for i, example in enumerate(examples):
         prompt_str = format_prompt(tokenizer, example["prompt"])
         encoded = tokenizer(prompt_str, return_tensors="pt").to(device)
         input_ids = encoded.input_ids
         attention_mask = encoded.attention_mask
-        gold = example["answer"].strip().upper()
+        gold = example["gold"]
 
         # generate rollouts
         rollouts = generate_rollouts(
@@ -285,8 +396,9 @@ def main():
         )
 
         # logprobs + region labels per rollout
-        answers, logprobs_list, regions_list = [], [], []
+        answers, texts, logprobs_list, regions_list = [], [], [], []
         for comp_ids, text in rollouts:
+            texts.append(text)
             answers.append(extract_answer(text))
             lp = get_logprobs(model, input_ids, comp_ids.to(device))
             logprobs_list.append(lp.cpu())
@@ -325,10 +437,10 @@ def main():
         sel_majority = select_majority(answers)
         sel_kl, _    = select_kl_centroid(logprobs_list, answers)
 
-        is_correct_majority = sel_majority == gold
-        correct_random   += int(sel_random == gold)
+        is_correct_majority = check_correct(sel_majority, gold)
+        correct_random   += int(check_correct(sel_random, gold))
         correct_majority += int(is_correct_majority)
-        correct_kl       += int(sel_kl == gold)
+        correct_kl       += int(check_correct(sel_kl, gold))
 
         # accumulate KL by correctness of majority answer
         # (majority is the best proxy for whether the question was "known")
@@ -342,6 +454,8 @@ def main():
         record = {
             "index": i,
             "gold": gold,
+            "prompt": example["prompt"],
+            "rollout_texts": texts,
             "answers": answers,
             "selected_random":      sel_random,
             "selected_majority":    sel_majority,
@@ -351,23 +465,23 @@ def main():
             "mean_kl_reasoning":    mean_kl_reasoning,
             "mean_kl_answer":       mean_kl_answer,
             "mean_reasoning_entropy": mean_reasoning_entropy,
-            "correct_random":   sel_random == gold,
+            "correct_random":   check_correct(sel_random, gold),
             "correct_majority": is_correct_majority,
-            "correct_kl":       sel_kl == gold,
+            "correct_kl":       check_correct(sel_kl, gold),
         }
         samples_file.write(json.dumps(record) + "\n")
         samples_file.flush()
 
-        if (i + 1) % 10 == 0:
+        if (i + 1) % 10 == 0 or args.smoke:
             n = i + 1
-            print(f"[{n}/{len(dataset)}]  "
+            print(f"[{n}/{len(examples)}]  "
                   f"random={correct_random/n:.3f}  "
                   f"majority={correct_majority/n:.3f}  "
                   f"kl={correct_kl/n:.3f}")
 
     samples_file.close()
 
-    n = len(dataset)
+    n = len(examples)
 
     def safe_mean(lst):
         return float(np.mean(lst)) if lst else None

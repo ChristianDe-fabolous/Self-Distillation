@@ -1,3 +1,5 @@
+*.ipynb
+
 .vscode/
 __pycache__/
 *.pyc
@@ -8,3 +10,7 @@ bsub_outputs/
 .hyperparameter_search_scripts_main/
 
 paper/
+
+./.env
+./env
+.env
