@@ -238,7 +238,7 @@ def generate_rollouts(model, tokenizer, input_ids, attention_mask, n_rollouts, t
             pad_token_id=tokenizer.eos_token_id,
         )
         completion_ids = output[0][input_ids.shape[1]:]
-        text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+        text = tokenizer.decode(completion_ids, skip_special_tokens=False)
         rollouts.append((completion_ids, text))
     return rollouts
 
